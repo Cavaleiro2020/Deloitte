@@ -28,18 +28,16 @@ TODO: Implement CSV-based product recommendations
 TODO: Implement multimodal RAG for image processing
 """
 
-import faiss
-from openai import AzureOpenAI
 from src.services.models.embeddings import Embeddings
 from src.services.vectorial_db.faiss_index import FAISSIndex
 from src.ingestion.ingest_files import ingest_files_data_folder
+from src.services.product_recommender import ProductRecommender
 from src.services.models.llm import LLM
-import os
 from dotenv import load_dotenv
 import time
 
 
-def chatbot(llm: LLM, input_text: str, history: list, index: FAISSIndex):
+def chatbot(llm: LLM, input_text: str, history: list, index: FAISSIndex, product_recommender: ProductRecommender):
     """
     Processes a user query through the RAG pipeline and returns a response.
     
@@ -67,6 +65,16 @@ def chatbot(llm: LLM, input_text: str, history: list, index: FAISSIndex):
     
     TODO: Add source citation - track which documents were used
     """
+    if product_recommender.is_product_query(input_text):
+        start = time.time()
+        recommendations = product_recommender.recommend(input_text, limit=5)
+        response = product_recommender.format_recommendations(recommendations, input_text)
+        print("Time for product recommendations =", time.time() - start, "seconds")
+
+        history.append({"role": "user", "content": input_text})
+        history.append({"role": "assistant", "content": response})
+        return response, history
+
     # STEP 1: RETRIEVAL - Find relevant document chunks
     start = time.time()
     retrieved_chunks, metadata_set = index.retrieve_chunks(input_text, num_chunks=5)
@@ -136,6 +144,7 @@ def main():
     # Note: Dimension is 3072 for text-embedding-3-large
     embeddings = Embeddings()
     index = FAISSIndex(embeddings=embeddings.get_embeddings, dimension=3072)
+    product_recommender = ProductRecommender()
 
     # Try to load existing index from disk, or create new one if not found
     try:
@@ -178,7 +187,7 @@ def main():
             break
         
         # Process the query through the RAG pipeline
-        response, history = chatbot(llm, user_input, history, index)
+        response, history = chatbot(llm, user_input, history, index, product_recommender)
         
         # Display the response
         # TODO: In Gradio, this would be rendered as a chat message

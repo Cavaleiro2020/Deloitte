@@ -7,13 +7,11 @@ based on the file extension, enabling polymorphic behavior for document processi
 """
 
 from src.ingestion.loaders.loaderBase import LoaderBase
+from src.ingestion.loaders.loaderCSV import LoaderCSV
 from src.ingestion.loaders.loaderDOCX import LoaderDOCX
 from src.ingestion.loaders.loaderHTML import LoaderHTML
 from src.ingestion.loaders.loaderPDF import LoaderPDF
 from src.ingestion.loaders.loaderPPTX import LoaderPPTX
-
-# TODO: Import CSV loader when implemented
-# from src.ingestion.loaders.loaderCSV import LoaderCSV
 
 
 class Loader:
@@ -97,10 +95,9 @@ class Loader:
                 # Word documents - uses python-docx library
                 return LoaderDOCX(self.filepath)
             
-            # TODO: Implement CSV loader for sustainable products data
-            # The bootcamp challenge requires loading product recommendations from CSV files.
-            # case "csv":
-            #     return LoaderCSV(self.filepath)
+            case "csv":
+                # CSV files are used for sustainable product recommendations.
+                return LoaderCSV(self.filepath)
             
             # TODO: Consider adding support for additional formats, if needed:
             # - xlsx (Excel files) - could use openpyxl or pandas

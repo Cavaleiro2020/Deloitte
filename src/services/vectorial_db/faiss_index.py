@@ -100,8 +100,10 @@ class FAISSIndex():
         
         # Parallel list to store the actual text chunks
         # chunks_list[i] corresponds to the vector at index i in the FAISS index
+        # Each entry may be a dict with 'text' and 'metadata' or a plain string.
         self.chunks_list: list = []
-        self.metadata_list: list = []  # Parallel list to store metadata for each chunk (e.g., source document)
+        # Parallel metadata list to store optional metadata for each chunk
+        self.metadata_list: list[dict] = []
     
     def _create_faiss_index(self):
         """
@@ -120,7 +122,7 @@ class FAISSIndex():
         """
         self.index = IndexFlatL2(self.dimension)
     
-    def ingest_text(self, text: str | None = None, text_chunks: list | None = None, docName = None, docPage = None) -> bool:
+    def ingest_text(self, text: str | None = None, text_chunks: list | None = None, docName=None, docPage=None) -> bool:
         """
         Ingests text into the FAISS index by converting chunks to embeddings and storing them.
         
@@ -171,26 +173,34 @@ class FAISSIndex():
             # with fixed chunk_size=500 and chunk_overlap=100
             text_chunks = text_to_chunks(text)
         
-        # Process each chunk: embed and store
-        for chunk in text_chunks:
+        # Process each chunk: support either plain strings or dicts with metadata
+        for chunk_item in text_chunks:
+            if isinstance(chunk_item, dict):
+                chunk_text = chunk_item.get('text', '')
+                metadata = chunk_item.get('metadata', {}) or {}
+            else:
+                chunk_text = chunk_item
+                metadata = {}
+
+            if docName is not None or docPage is not None:
+                metadata = {
+                    **metadata,
+                    "docName": metadata.get("docName", docName),
+                    "docPage": metadata.get("docPage", docPage),
+                }
+
             # Generate embedding vector for this chunk (API call to OpenAI)
-            embedding = self.embeddings(chunk)
-            
+            embedding = self.embeddings(chunk_text)
+
             # Convert to numpy array with float32 dtype (FAISS requirement)
-            # Shape is (1, dimension) because FAISS add() expects a 2D array
             embedding_array = np.array([embedding]).astype('float32')
-            
+
             # Add the vector to the FAISS index
-            # The index automatically assigns an integer ID (0, 1, 2, ...)
             self.index.add(embedding_array)
 
-            # Add metadata for this chunk (e.g., source document name and page number)
-            metadata = {"docName": docName, "docPage": docPage}
+            # Store the original text chunk and metadata at the same index
+            self.chunks_list.append(chunk_text)
             self.metadata_list.append(metadata)
-            
-            # Store the original text chunk at the same index
-            # This maintains the correspondence: chunks_list[i] ↔ FAISS vector[i]
-            self.chunks_list += [chunk]
         
         return True
     
@@ -236,18 +246,18 @@ class FAISSIndex():
         # We use _ to ignore distances since we only need the indices
         limit = min(num_chunks, len(self.chunks_list))
         _, I = self.index.search(query_vector, limit)
-        
+
+        # Retrieve the actual text chunks and their metadata using the indices
         chunks = []
         metadata = []
-        # Retrieve the actual text chunks using the indices
         # I[0] because search returns a 2D array (supports batch queries)
         for i in I[0]:
             if i < 0 or i >= len(self.chunks_list):
                 continue
 
             chunks.append(self.chunks_list[i])
-            metadata.append(self._safe_metadata(i))
-        
+            metadata.append(self.metadata_list[i] if i < len(self.metadata_list) else {})
+
         return chunks, metadata
     
     def save_index(self, path=r"./faiss_index"):
@@ -363,9 +373,3 @@ class FAISSIndex():
                 self.metadata_list = json.load(metadata_file)
         else:
             self.metadata_list = [{"docName": None, "docPage": None} for _ in self.chunks_list]
-
-    def _safe_metadata(self, index: int) -> tuple:
-        if 0 <= index < len(self.metadata_list):
-            md = self.metadata_list[index] or {}
-            return md.get("docName"), md.get("docPage")
-        return None, None
