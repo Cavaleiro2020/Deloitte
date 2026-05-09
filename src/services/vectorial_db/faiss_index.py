@@ -15,6 +15,7 @@ It uses L2 (Euclidean) distance for finding the nearest neighbors to a query vec
 from faiss import IndexFlatL2, write_index, read_index
 import numpy as np
 import os
+import json
 
 from src.ingestion.chunking.token_chunking import text_to_chunks
 
@@ -121,7 +122,7 @@ class FAISSIndex():
         """
         self.index = IndexFlatL2(self.dimension)
     
-    def ingest_text(self, text: str | None = None, text_chunks: list | None = None) -> bool:
+    def ingest_text(self, text: str | None = None, text_chunks: list | None = None, docName=None, docPage=None) -> bool:
         """
         Ingests text into the FAISS index by converting chunks to embeddings and storing them.
         
@@ -176,10 +177,17 @@ class FAISSIndex():
         for chunk_item in text_chunks:
             if isinstance(chunk_item, dict):
                 chunk_text = chunk_item.get('text', '')
-                metadata = chunk_item.get('metadata', {})
+                metadata = chunk_item.get('metadata', {}) or {}
             else:
                 chunk_text = chunk_item
                 metadata = {}
+
+            if docName is not None or docPage is not None:
+                metadata = {
+                    **metadata,
+                    "docName": metadata.get("docName", docName),
+                    "docPage": metadata.get("docPage", docPage),
+                }
 
             # Generate embedding vector for this chunk (API call to OpenAI)
             embedding = self.embeddings(chunk_text)
@@ -236,20 +244,21 @@ class FAISSIndex():
         # Search the FAISS index for the k nearest neighbors
         # Returns: D = distances (lower is better), I = indices of matched vectors
         # We use _ to ignore distances since we only need the indices
-        _, I = self.index.search(query_vector, num_chunks)
-        
-        # Retrieve the actual text chunks and their metadata using the indices
-        results = []
-        for i in I[0]:
-            try:
-                text = self.chunks_list[i]
-                meta = self.metadata_list[i] if i < len(self.metadata_list) else {}
-            except IndexError:
-                text = ''
-                meta = {}
-            results.append((text, meta))
+        limit = min(num_chunks, len(self.chunks_list))
+        _, I = self.index.search(query_vector, limit)
 
-        return results
+        # Retrieve the actual text chunks and their metadata using the indices
+        chunks = []
+        metadata = []
+        # I[0] because search returns a 2D array (supports batch queries)
+        for i in I[0]:
+            if i < 0 or i >= len(self.chunks_list):
+                continue
+
+            chunks.append(self.chunks_list[i])
+            metadata.append(self.metadata_list[i] if i < len(self.metadata_list) else {})
+
+        return chunks, metadata
     
     def save_index(self, path=r"./faiss_index"):
         """
@@ -291,6 +300,7 @@ class FAISSIndex():
         # Construct full file paths
         index_path = os.path.join(path, "index.faiss")
         chunks_path = os.path.join(path, "chunks.npy")
+        metadata_path = os.path.join(path, "metadata.json")
         
         # Create directory if it doesn't exist
         if not os.path.exists(path):
@@ -302,6 +312,10 @@ class FAISSIndex():
         # Save the parallel chunks list as a NumPy array
         # allow_pickle=True is needed for Python object serialization
         np.save(chunks_path, self.chunks_list)
+
+        # Save metadata separately so retrieved chunks can be traced back to source documents
+        with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+            json.dump(self.metadata_list, metadata_file)
     
     def load_index(self, path: str = r"./faiss_index"):
         """
@@ -340,6 +354,7 @@ class FAISSIndex():
         # Construct full file paths
         index_path = os.path.join(path, "index.faiss")
         chunks_path = os.path.join(path, "chunks.npy")
+        metadata_path = os.path.join(path, "metadata.json")
         
         # Check if the index directory exists
         if not os.path.exists(path):
@@ -351,3 +366,10 @@ class FAISSIndex():
         # Load the chunks array from disk
         # allow_pickle=True is needed to load Python objects
         self.chunks_list = np.load(chunks_path, allow_pickle=True).tolist()
+
+        # Load metadata when available; fall back to empty metadata for older saved indexes
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                self.metadata_list = json.load(metadata_file)
+        else:
+            self.metadata_list = [{"docName": None, "docPage": None} for _ in self.chunks_list]

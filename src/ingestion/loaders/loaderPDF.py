@@ -29,10 +29,10 @@ class LoaderPDF(LoaderBase):
     def extract_text(self):
         with open(self.filepath, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
-            text = ""
+            text_by_page = []
             for page_num in range(len(reader.pages)):
-                text += " " + reader.pages[page_num].extract_text()
-        return text
+                text_by_page.append(reader.pages[page_num].extract_text())
+        return text_by_page
 
     def all_keys_have_values(self, metadata, value_check=lambda x: x is not None and x != ''):
         return all(value_check(value) for value in metadata.values())
