@@ -99,7 +99,10 @@ class FAISSIndex():
         
         # Parallel list to store the actual text chunks
         # chunks_list[i] corresponds to the vector at index i in the FAISS index
+        # Each entry may be a dict with 'text' and 'metadata' or a plain string.
         self.chunks_list: list = []
+        # Parallel metadata list to store optional metadata for each chunk
+        self.metadata_list: list[dict] = []
     
     def _create_faiss_index(self):
         """
@@ -169,22 +172,27 @@ class FAISSIndex():
             # with fixed chunk_size=500 and chunk_overlap=100
             text_chunks = text_to_chunks(text)
         
-        # Process each chunk: embed and store
-        for chunk in text_chunks:
+        # Process each chunk: support either plain strings or dicts with metadata
+        for chunk_item in text_chunks:
+            if isinstance(chunk_item, dict):
+                chunk_text = chunk_item.get('text', '')
+                metadata = chunk_item.get('metadata', {})
+            else:
+                chunk_text = chunk_item
+                metadata = {}
+
             # Generate embedding vector for this chunk (API call to OpenAI)
-            embedding = self.embeddings(chunk)
-            
+            embedding = self.embeddings(chunk_text)
+
             # Convert to numpy array with float32 dtype (FAISS requirement)
-            # Shape is (1, dimension) because FAISS add() expects a 2D array
             embedding_array = np.array([embedding]).astype('float32')
-            
+
             # Add the vector to the FAISS index
-            # The index automatically assigns an integer ID (0, 1, 2, ...)
             self.index.add(embedding_array)
-            
-            # Store the original text chunk at the same index
-            # This maintains the correspondence: chunks_list[i] ↔ FAISS vector[i]
-            self.chunks_list += [chunk]
+
+            # Store the original text chunk and metadata at the same index
+            self.chunks_list.append(chunk_text)
+            self.metadata_list.append(metadata)
         
         return True
     
@@ -230,9 +238,18 @@ class FAISSIndex():
         # We use _ to ignore distances since we only need the indices
         _, I = self.index.search(query_vector, num_chunks)
         
-        # Retrieve the actual text chunks using the indices
-        # I[0] because search returns a 2D array (supports batch queries)
-        return [self.chunks_list[i] for i in I[0]]
+        # Retrieve the actual text chunks and their metadata using the indices
+        results = []
+        for i in I[0]:
+            try:
+                text = self.chunks_list[i]
+                meta = self.metadata_list[i] if i < len(self.metadata_list) else {}
+            except IndexError:
+                text = ''
+                meta = {}
+            results.append((text, meta))
+
+        return results
     
     def save_index(self, path=r"./faiss_index"):
         """
