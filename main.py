@@ -69,12 +69,25 @@ def chatbot(llm: LLM, input_text: str, history: list, index: FAISSIndex):
     """
     # STEP 1: RETRIEVAL - Find relevant document chunks
     start = time.time()
-    retrieved_chunks = index.retrieve_chunks(input_text, num_chunks=5)
+    retrieved_chunks, metadata_set = index.retrieve_chunks(input_text, num_chunks=5)
     
     # Combine retrieved chunks into a single context string
     # Chunks are separated by ##### for clarity in the prompt
     # TODO: Add source attribution - include document names with each chunk
     context = "\n\n#####\n\n".join(retrieved_chunks)
+    # Add metadata to the context
+    formatted_sources = []
+    for md in metadata_set:
+        if isinstance(md, dict):
+            doc_name = md.get("docName")
+            doc_page = md.get("docPage")
+        else:
+            doc_name, doc_page = md
+        formatted_sources.append(f"Source: {doc_name} (Page: {doc_page})")
+
+    if formatted_sources:
+        metadata_context = "\n\n#####\n\n".join(formatted_sources)
+        context = f"{context}\n\n#####\n\n{metadata_context}"
     
     print("Time for retrieval =", time.time() - start, "seconds")
     
@@ -83,13 +96,17 @@ def chatbot(llm: LLM, input_text: str, history: list, index: FAISSIndex):
     response = llm.get_response(history, context, input_text)
     print("Time for response =", time.time() - start, "seconds")
 
+    response_with_sources = response
+    if formatted_sources:
+        response_with_sources = f"{response}\n\nSources:\n" + "\n".join(f"- {source}" for source in formatted_sources)
+
     # STEP 3: HISTORY MANAGEMENT - Update conversation history
     # TODO: Consider limiting history length to avoid token limits
     # TODO: Implement conversation summarization for long chats
     history.append({"role": "user", "content": input_text})
-    history.append({"role": "assistant", "content": response})
+    history.append({"role": "assistant", "content": response_with_sources})
     
-    return response, history
+    return response_with_sources, history
 
 
 def main():

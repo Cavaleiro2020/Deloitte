@@ -15,6 +15,7 @@ It uses L2 (Euclidean) distance for finding the nearest neighbors to a query vec
 from faiss import IndexFlatL2, write_index, read_index
 import numpy as np
 import os
+import json
 
 from src.ingestion.chunking.token_chunking import text_to_chunks
 
@@ -100,6 +101,7 @@ class FAISSIndex():
         # Parallel list to store the actual text chunks
         # chunks_list[i] corresponds to the vector at index i in the FAISS index
         self.chunks_list: list = []
+        self.metadata_list: list = []  # Parallel list to store metadata for each chunk (e.g., source document)
     
     def _create_faiss_index(self):
         """
@@ -118,7 +120,7 @@ class FAISSIndex():
         """
         self.index = IndexFlatL2(self.dimension)
     
-    def ingest_text(self, text: str | None = None, text_chunks: list | None = None) -> bool:
+    def ingest_text(self, text: str | None = None, text_chunks: list | None = None, docName = None, docPage = None) -> bool:
         """
         Ingests text into the FAISS index by converting chunks to embeddings and storing them.
         
@@ -181,6 +183,10 @@ class FAISSIndex():
             # Add the vector to the FAISS index
             # The index automatically assigns an integer ID (0, 1, 2, ...)
             self.index.add(embedding_array)
+
+            # Add metadata for this chunk (e.g., source document name and page number)
+            metadata = {"docName": docName, "docPage": docPage}
+            self.metadata_list.append(metadata)
             
             # Store the original text chunk at the same index
             # This maintains the correspondence: chunks_list[i] ↔ FAISS vector[i]
@@ -228,11 +234,21 @@ class FAISSIndex():
         # Search the FAISS index for the k nearest neighbors
         # Returns: D = distances (lower is better), I = indices of matched vectors
         # We use _ to ignore distances since we only need the indices
-        _, I = self.index.search(query_vector, num_chunks)
+        limit = min(num_chunks, len(self.chunks_list))
+        _, I = self.index.search(query_vector, limit)
         
+        chunks = []
+        metadata = []
         # Retrieve the actual text chunks using the indices
         # I[0] because search returns a 2D array (supports batch queries)
-        return [self.chunks_list[i] for i in I[0]]
+        for i in I[0]:
+            if i < 0 or i >= len(self.chunks_list):
+                continue
+
+            chunks.append(self.chunks_list[i])
+            metadata.append(self._safe_metadata(i))
+        
+        return chunks, metadata
     
     def save_index(self, path=r"./faiss_index"):
         """
@@ -274,6 +290,7 @@ class FAISSIndex():
         # Construct full file paths
         index_path = os.path.join(path, "index.faiss")
         chunks_path = os.path.join(path, "chunks.npy")
+        metadata_path = os.path.join(path, "metadata.json")
         
         # Create directory if it doesn't exist
         if not os.path.exists(path):
@@ -285,6 +302,10 @@ class FAISSIndex():
         # Save the parallel chunks list as a NumPy array
         # allow_pickle=True is needed for Python object serialization
         np.save(chunks_path, self.chunks_list)
+
+        # Save metadata separately so retrieved chunks can be traced back to source documents
+        with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+            json.dump(self.metadata_list, metadata_file)
     
     def load_index(self, path: str = r"./faiss_index"):
         """
@@ -323,6 +344,7 @@ class FAISSIndex():
         # Construct full file paths
         index_path = os.path.join(path, "index.faiss")
         chunks_path = os.path.join(path, "chunks.npy")
+        metadata_path = os.path.join(path, "metadata.json")
         
         # Check if the index directory exists
         if not os.path.exists(path):
@@ -334,3 +356,16 @@ class FAISSIndex():
         # Load the chunks array from disk
         # allow_pickle=True is needed to load Python objects
         self.chunks_list = np.load(chunks_path, allow_pickle=True).tolist()
+
+        # Load metadata when available; fall back to empty metadata for older saved indexes
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                self.metadata_list = json.load(metadata_file)
+        else:
+            self.metadata_list = [{"docName": None, "docPage": None} for _ in self.chunks_list]
+
+    def _safe_metadata(self, index: int) -> tuple:
+        if 0 <= index < len(self.metadata_list):
+            md = self.metadata_list[index] or {}
+            return md.get("docName"), md.get("docPage")
+        return None, None

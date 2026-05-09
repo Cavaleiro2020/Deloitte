@@ -22,7 +22,12 @@ def ingest_files_data_folder(index: FAISSIndex):
         loader = Loader(extension=file.split(".")[-1], filepath=os.path.join(DATA_FOLDER, file))
         text = loader.extract_text()
         print(f"Ingesting {file}")
-        index.ingest_text(text=text)
+        if file.endswith('.pdf'):
+            for i, page_text in enumerate(text):
+                index.ingest_text(text=page_text, docName=file, docPage=i + 1)
+        else:
+            index.ingest_text(text=text, docName=file, docPage=None)
+            text = "\n".join(text)  # Join the text by page into a single string
 
 if __name__ == "__main__":
     from src.services.models.embeddings import Embeddings
