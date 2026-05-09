@@ -26,10 +26,7 @@ GRADIO DOCUMENTATION:
 
 import gradio as gr
 from dotenv import load_dotenv
-import os
 import shutil
-import csv
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -38,9 +35,12 @@ from pathlib import Path
 from src.services.vectorial_db.faiss_index import FAISSIndex
 from src.services.models.llm import LLM
 from src.services.models.embeddings import Embeddings
+from src.services.product_recommender import ProductRecommender
 from src.ingestion.ingest_files import ingest_files_data_folder
 from src.ingestion.loaders.loader import Loader
 from src.ingestion.chunking.token_chunking import text_to_chunks
+from src.ingestion.multimodal_ingest import multimodal_ingest
+from src.ingestion.visual_parsers import ocr_text, vision_describe
 
 
 # Load environment variables
@@ -72,14 +72,14 @@ except:
 
 # TODO: Initialize global variables for state management
 conversation_histories = {}  # Dictionary to store conversation history per session
-PRODUCTS_CACHE = None
+product_recommender = ProductRecommender()
 
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
-def format_sources(retrieved_chunks, num_sources=3):
+def format_sources(retrieved_chunks, metadata_list, num_sources=5):
     """
     Format retrieved document chunks as source citations.
     
@@ -106,334 +106,65 @@ def format_sources(retrieved_chunks, num_sources=3):
         return "**Sources used:** No sources retrieved."
 
     sources = ["**Sources used:**"]
+    visual_notes = ["**Visual evidence:**"]
+    has_visual_notes = False
 
     for i, chunk in enumerate(retrieved_chunks[:num_sources], start=1):
-        if chunk is None:
-            sources.append(f"{i}. _Empty source chunk_")
-            continue
+        text = str(chunk or "").strip()
+        metadata = metadata_list[i - 1] if i - 1 < len(metadata_list) else {}
 
-        if isinstance(chunk, dict):
-            text = (
-                chunk.get("text")
-                or chunk.get("content")
-                or chunk.get("chunk")
-                or ""
-            )
+        if not isinstance(metadata, dict):
+            metadata = {}
 
-            source = (
-                chunk.get("source")
-                or chunk.get("filename")
-                or chunk.get("document")
-            )
+        source_name = (
+            metadata.get("docName")
+            or metadata.get("source_file")
+            or metadata.get("source")
+            or "Unknown source"
+        )
+        page = metadata.get("docPage")
+        if page is None:
+            page = metadata.get("page")
+        section = metadata.get("section")
+        chunk_type = metadata.get("type")
 
-            page = chunk.get("page")
-            section = chunk.get("section")
+        citation = f"{i}. `{source_name}`"
+        if page is not None:
+            citation += f", page {page}"
+        elif section:
+            citation += f", section {section}"
+        if chunk_type:
+            citation += f" ({chunk_type})"
 
-            if source:
-                citation = f"{i}. `{source}`"
+        sources.append(citation)
 
-                if page is not None:
-                    citation += f", page {page}"
-                elif section is not None:
-                    citation += f", section {section}"
+        if chunk_type in {"ocr", "vision"}:
+            has_visual_notes = True
+            preview = " ".join(text.replace("\n", " ").split())[:160]
+            image_path = metadata.get("image_path")
+            observations = metadata.get("observations")
 
-                sources.append(citation)
-            else:
-                preview = str(text).replace("\n", " ").strip()
-                preview = " ".join(preview.split())
+            details = [f"{i}. `{source_name}`"]
+            if page is not None:
+                details.append(f"page {page}")
+            details.append(f"type: {chunk_type}")
+            if image_path:
+                details.append(f"image: {image_path}")
+            visual_notes.append(" | ".join(details))
 
-                if len(preview) > 250:
-                    preview = preview[:250] + "..."
+            if observations:
+                visual_notes.append(f"   - observations: {', '.join(str(o) for o in observations[:4])}")
 
-                sources.append(f"{i}. _{preview}_")
+            if preview:
+                visual_notes.append(f"   - preview: {preview}")
 
-        else:
-            preview = str(chunk).replace("\n", " ").strip()
-            preview = " ".join(preview.split())
-
-            if len(preview) > 250:
-                preview = preview[:250] + "..."
-
-            sources.append(f"{i}. _{preview}_")
+    if has_visual_notes:
+        return "\n".join(sources + ["", *visual_notes])
 
     return "\n".join(sources)
 
 
-def load_sustainable_products():
-    """
-    Load sustainable product rows from CSV once and cache them for future responses.
-    """
-    global PRODUCTS_CACHE
-
-    if PRODUCTS_CACHE is not None:
-        return PRODUCTS_CACHE
-
-    product_paths = [
-        Path("data") / "sustainable_products.csv",
-        Path("sustainable_products.csv"),
-    ]
-
-    csv_path = next((path for path in product_paths if path.exists()), None)
-    if csv_path is None:
-        PRODUCTS_CACHE = []
-        return PRODUCTS_CACHE
-
-    try:
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as csv_file:
-            PRODUCTS_CACHE = list(csv.DictReader(csv_file))
-    except Exception:
-        PRODUCTS_CACHE = []
-
-    return PRODUCTS_CACHE
-
-
-def extract_product_recommendations(response_text, user_message=None):
-    """
-    Extract product recommendations from the LLM response.
-    
-    TODO: Implement product recommendation extraction and formatting.
-    
-    Args:
-        response_text (str): The LLM's response text
-        user_message (str | None): The user's original message, when available
-    
-    Returns:
-        str: Formatted product recommendations in HTML/Markdown, or empty string
-    
-    APPROACH 1: Parse LLM response for product mentions
-    - Look for product names/IDs in the response
-    - Match against sustainable_products.csv
-    - Format as a nice product card
-    
-    APPROACH 2: Separate product search
-    - Use an LLM to detect if user is asking for products
-    - Provide the LLM with the user's query and the CSV data and ask for recommendations
-    - Format results as product recommendations
-    
-    HINT: You'll need to load sustainable_products.csv and search it
-          based on the user's query or LLM response.
-    """
-    if not response_text and not user_message:
-        return ""
-
-    user_text = str(user_message or "")
-    response_text = str(response_text or "")
-    combined_text = f"{user_text}\n{response_text}"
-    lower_combined = combined_text.lower()
-    lower_user = user_text.lower()
-
-    product_keywords = [
-        "product",
-        "products",
-        "recommend",
-        "recommends",
-        "recommended",
-        "recommendation",
-        "recommendations",
-        "buy",
-        "purchase",
-        "swap",
-        "swaps",
-        "alternative",
-        "sustainable alternative",
-        "sustainable alternatives",
-        "eco-friendly",
-        "reusable",
-        "plastic",
-        "home",
-        "packaging",
-        "appliance",
-        "appliances",
-        "clothing",
-        "cleaning",
-        "toothbrush",
-        "bottle",
-        "bottles",
-        "bag",
-        "bags",
-        "solar",
-        "led",
-    ]
-
-    product_related = any(
-        re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", lower_user)
-        for keyword in product_keywords
-    )
-
-    if not product_related:
-        return ""
-
-    products = load_sustainable_products()
-    if not products:
-        return ""
-
-    category_keywords = {
-        "Reusable Items": [
-            "reusable", "reuse", "plastic", "packaging", "bag", "bags",
-            "bottle", "bottles", "straw", "straws", "wrap", "storage",
-            "kitchen", "home", "container", "containers", "produce",
-        ],
-        "Energy Efficiency": [
-            "home", "energy", "efficient", "efficiency", "electricity",
-            "appliance", "appliances", "led", "bulb", "thermostat",
-            "shower", "showerhead", "power", "carbon footprint",
-        ],
-        "Renewable Energy": [
-            "solar", "renewable", "charger", "charging", "lantern",
-            "energy", "radio", "bike", "bicycle", "outdoor",
-        ],
-        "Personal Care": [
-            "personal", "care", "bathroom", "toothbrush", "toothpaste",
-            "soap", "shampoo", "makeup", "comb", "hygiene",
-        ],
-        "Sustainable Fashion": [
-            "clothing", "fashion", "shirt", "t-shirt", "shoes",
-            "sneakers", "jacket", "textile", "recycled materials",
-            "wear", "apparel",
-        ],
-    }
-
-    stopwords = {
-        "about", "after", "also", "alternatives", "and", "are", "can",
-        "for", "from", "friendly", "have", "home", "into", "made",
-        "more", "product", "products", "recommend", "sustainable",
-        "that", "the", "their", "this", "with", "what", "when", "your",
-    }
-    query_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", lower_combined)
-        if len(token) >= 4 and token not in stopwords
-    }
-
-    matches = []
-    seen_names = set()
-
-    for product in products:
-        name = (
-            product.get("Product Name")
-            or product.get("product name")
-            or product.get("name")
-            or product.get("Name")
-            or ""
-        ).strip()
-        category = (
-            product.get("Category")
-            or product.get("category")
-            or ""
-        ).strip()
-        description = (
-            product.get("Description")
-            or product.get("description")
-            or product.get("Why it fits")
-            or ""
-        ).strip()
-
-        if not (name or category or description):
-            continue
-
-        dedupe_key = (name or description or category).lower()
-        if dedupe_key in seen_names:
-            continue
-
-        score = 0
-        searchable_fields = [name, category, description]
-
-        name_lower = name.lower()
-        category_lower = category.lower()
-        description_lower = description.lower()
-
-        if name_lower and name_lower in lower_combined:
-            score += 8
-
-        if category_lower and category_lower in lower_combined:
-            score += 4
-
-        for category_name, keywords in category_keywords.items():
-            if category == category_name:
-                for keyword in keywords:
-                    if re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", lower_combined):
-                        score += 2
-
-        for field in searchable_fields:
-            field_lower = field.lower()
-            if field_lower and field_lower in lower_combined:
-                score += 3 if field == name else 2
-
-            for token in field_lower.replace("/", " ").replace("-", " ").split():
-                token = re.sub(r"[^a-z0-9]", "", token)
-                if len(token) >= 4 and token in query_tokens:
-                    score += 1
-
-        if "plastic" in lower_combined and "plastic" in description_lower:
-            score += 3
-
-        if "home" in lower_combined and category in {"Energy Efficiency", "Reusable Items", "Renewable Energy"}:
-            score += 2
-
-        if score > 0:
-            matches.append((score, product))
-            seen_names.add(dedupe_key)
-
-    if not matches:
-        return ""
-
-    def review_score(product):
-        try:
-            return float(product.get("Review Score") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    matches.sort(key=lambda item: (item[0], review_score(item[1])), reverse=True)
-
-    lines = ["**Recommended sustainable products:**", ""]
-
-    for index, (_, product) in enumerate(matches[:3], start=1):
-        name = (
-            product.get("Product Name")
-            or product.get("product name")
-            or product.get("name")
-            or product.get("Name")
-            or "Sustainable product"
-        ).strip()
-        category = (product.get("Category") or product.get("category") or "").strip()
-        description = (
-            product.get("Description")
-            or product.get("description")
-            or ""
-        ).strip()
-        review_score = (
-            product.get("Review Score")
-            or product.get("Sustainability score")
-            or product.get("sustainability score")
-            or product.get("score")
-            or ""
-        )
-        price = product.get("Price ($)") or product.get("price") or product.get("Price") or ""
-        countries = product.get("Countries") or product.get("countries") or ""
-
-        lines.append(f"{index}. **{name}**")
-
-        if category:
-            lines.append(f"   - Category: {category}")
-
-        if description:
-            lines.append(f"   - Why it fits: {description}")
-
-        if review_score:
-            lines.append(f"   - Review score: {review_score}/5")
-
-        if price:
-            lines.append(f"   - Price: ${price}")
-
-        if countries:
-            lines.append(f"   - Available in: {countries}")
-
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-def chatbot_response(message, history):
+def chatbot_response(message, history, num_chunks=5, show_sources=True):
     """
     Main chatbot function that processes user input and returns a response.
     
@@ -465,19 +196,26 @@ def chatbot_response(message, history):
             if bot_msg:
                 llm_history.append({"role": "assistant", "content": bot_msg})
 
-        retrieved_chunks = faiss_index.retrieve_chunks(message, num_chunks=5)
-        context = "\n\n#####\n\n".join(retrieved_chunks)
+        if product_recommender.is_product_query(message):
+            recommendations = product_recommender.recommend(message, limit=5)
+            response = product_recommender.format_recommendations(recommendations, message)
+            return "🟢 Routed to product recommender\n\n" + response
 
+        retrieval_result = faiss_index.retrieve_chunks(message, num_chunks=int(num_chunks))
+        if isinstance(retrieval_result, tuple) and len(retrieval_result) == 2:
+            retrieved_chunks, metadata_list = retrieval_result
+        else:
+            retrieved_chunks = retrieval_result or []
+            metadata_list = [{} for _ in retrieved_chunks]
+
+        context = "\n\n#####\n\n".join(str(chunk) for chunk in retrieved_chunks)
         response = llm.get_response(llm_history, context, message)
 
-        sources = format_sources(retrieved_chunks)
-        formatted_response = f"{response}\n\n---\n{sources}"
+        if not show_sources:
+            return response
 
-        products = extract_product_recommendations(response, message)
-        if products:
-            formatted_response += f"\n\n{products}"
-
-        return formatted_response
+        sources = format_sources(retrieved_chunks, metadata_list, num_sources=int(num_chunks))
+        return f"🔵 Routed to RAG retrieval\n\n{response}\n\n---\n{sources}"
 
     except Exception as e:
         return (
@@ -591,7 +329,7 @@ def export_conversation(history):
     return str(export_path)
 
 
-def upload_document(file):
+def upload_document(file, enable_multimodal=False, use_vision=False):
     """
     Upload and ingest a new document into the RAG system.
     
@@ -617,7 +355,10 @@ def upload_document(file):
     if file is None:
         return "Please select a file first."
 
-    supported_extensions = {".pdf", ".html", ".htm", ".docx", ".pptx", ".csv", ".txt"}
+    supported_extensions = {
+        ".pdf", ".html", ".htm", ".docx", ".pptx", ".csv", ".txt",
+        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+    }
 
     try:
         if isinstance(file, (str, Path)):
@@ -652,21 +393,114 @@ def upload_document(file):
 
         shutil.copy2(source_path, destination_path)
 
-        if extension in {".txt", ".csv"}:
-            text = destination_path.read_text(encoding="utf-8", errors="replace")
-        else:
-            loader_extension = "html" if extension == ".htm" else extension.lstrip(".")
-            loader = Loader(filepath=str(destination_path), extension=loader_extension)
-            text = loader.extract_text()
+        if extension == ".csv":
+            return (
+                f"Uploaded {destination_path.name}. CSV files are reserved for product recommendations "
+                "and are not ingested into the document FAISS index."
+            )
 
-        if not text or not text.strip():
+        if enable_multimodal and extension == ".pdf":
+            ingested = multimodal_ingest(str(destination_path), faiss_index, use_vision=bool(use_vision))
+            if not ingested:
+                return (
+                    f"Uploaded {destination_path.name}, but no visual chunks were extracted. "
+                    "Check OCR/vision dependencies."
+                )
+
+            faiss_index.save_index()
+            mode = "OCR + vision" if use_vision else "OCR only"
+            return (
+                f"Successfully uploaded {destination_path.name} with multimodal ingestion ({mode}). "
+                "Visual chunks were added to FAISS."
+            )
+
+        if extension in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+            ocr_chunk = ocr_text(str(destination_path))
+            chunks = []
+
+            if ocr_chunk:
+                chunks.append(
+                    {
+                        "text": f"[OCR image]\n{ocr_chunk}",
+                        "metadata": {
+                            "source_file": destination_path.name,
+                            "page": 1,
+                            "type": "ocr",
+                            "image_path": str(destination_path),
+                        },
+                    }
+                )
+
+            if use_vision:
+                description = vision_describe(str(destination_path))
+                if description and description.get("description"):
+                    chunks.append(
+                        {
+                            "text": f"[Vision image]\n{description.get('description', '')}",
+                            "metadata": {
+                                "source_file": destination_path.name,
+                                "page": 1,
+                                "type": "vision",
+                                "image_path": str(destination_path),
+                                "observations": description.get("observations", []),
+                            },
+                        }
+                    )
+
+            if not chunks:
+                return f"Uploaded {destination_path.name}, but no OCR or vision content could be extracted."
+
+            faiss_index.ingest_text(text_chunks=chunks)
+            faiss_index.save_index()
+            return f"Successfully uploaded and indexed visual content from {destination_path.name}."
+
+        if extension == ".txt":
+            text = destination_path.read_text(encoding="utf-8", errors="replace")
+            chunks = text_to_chunks(text)
+            faiss_index.ingest_text(text_chunks=chunks, docName=destination_path.name, docPage=None)
+            faiss_index.save_index()
+            return (
+                f"Successfully uploaded and ingested {destination_path.name}. "
+                f"Added {len(chunks)} chunks to the FAISS index."
+            )
+
+        loader_extension = "html" if extension == ".htm" else extension.lstrip(".")
+        loader = Loader(filepath=str(destination_path), extension=loader_extension)
+        extracted = loader.extract_text()
+
+        if isinstance(extracted, list):
+            indexed_pages = 0
+            for page_number, page_text in enumerate(extracted, start=1):
+                if not page_text or not str(page_text).strip():
+                    continue
+                page_chunks = text_to_chunks(str(page_text))
+                if not page_chunks:
+                    continue
+                faiss_index.ingest_text(
+                    text_chunks=page_chunks,
+                    docName=destination_path.name,
+                    docPage=page_number,
+                )
+                indexed_pages += 1
+
+            if indexed_pages == 0:
+                return f"Uploaded {destination_path.name}, but no text chunks were created from pages."
+
+            faiss_index.save_index()
+            return (
+                f"Successfully uploaded and ingested {destination_path.name}. "
+                f"Indexed {indexed_pages} page(s) into FAISS."
+            )
+
+        text = str(extracted or "")
+        if not text.strip():
             return f"Uploaded {destination_path.name}, but no text could be extracted."
 
         chunks = text_to_chunks(text)
         if not chunks:
             return f"Uploaded {destination_path.name}, but no chunks were created."
 
-        faiss_index.ingest_text(text_chunks=chunks)
+        faiss_index.ingest_text(text_chunks=chunks, docName=destination_path.name, docPage=None)
         faiss_index.save_index()
 
         return (
@@ -1035,12 +869,17 @@ def create_interface():
 
         return classic_history
 
-    def submit_message(message, history):
+    def submit_message(message, history, num_chunks, show_sources):
         if not message or not message.strip():
             return history or [], ""
 
         history = history or []
-        response = chatbot_response(message, history_to_classic(history))
+        response = chatbot_response(
+            message,
+            history_to_classic(history),
+            num_chunks=num_chunks,
+            show_sources=show_sources,
+        )
         updated_history = [
             *history,
             {"role": "user", "content": message},
@@ -1089,13 +928,35 @@ def create_interface():
 
                 gr.Markdown("Upload knowledge", elem_classes=["sidebar-section"])
                 document_upload = gr.File(
-                    label="📎 Upload PDF, HTML, DOCX, PPTX, CSV, or TXT",
-                    file_types=[".pdf", ".html", ".htm", ".docx", ".pptx", ".csv", ".txt"],
+                    label="📎 Upload PDF, HTML, DOCX, PPTX, CSV, TXT, or image",
+                    file_types=[
+                        ".pdf", ".html", ".htm", ".docx", ".pptx", ".csv", ".txt",
+                        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+                    ],
+                )
+                enable_multimodal = gr.Checkbox(
+                    value=False,
+                    label="Enable multimodal ingestion for PDFs",
+                )
+                use_vision = gr.Checkbox(
+                    value=False,
+                    label="Use Azure vision (if configured)",
                 )
                 upload_btn = gr.Button("Upload and ingest", elem_classes=["sidebar-button"])
                 upload_status = gr.Markdown()
 
                 gr.Markdown("⚙ Settings", elem_classes=["sidebar-section"])
+                chunks_slider = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    step=1,
+                    value=5,
+                    label="Retrieved chunks",
+                )
+                show_sources = gr.Checkbox(
+                    value=True,
+                    label="Show source citations",
+                )
                 gr.Markdown(
                     "Local RAG mode · FAISS index · Azure OpenAI",
                     elem_id="sidebar-note",
@@ -1148,11 +1009,11 @@ def create_interface():
 
                 chatbot = gr.Chatbot(
                     elem_id="chatbot",
-                label="Conversation",
-                render_markdown=True,
+                    label="Conversation",
+                    render_markdown=True,
                     height=420,
                     placeholder="Ask about climate change, product swaps, emissions, and green energy.",
-            )
+                )
 
                 with gr.Row(elem_id="input-bar"):
                     message_input = gr.Textbox(
@@ -1175,13 +1036,13 @@ def create_interface():
 
             message_input.submit(
                 fn=submit_message,
-                inputs=[message_input, chatbot],
+                inputs=[message_input, chatbot, chunks_slider, show_sources],
                 outputs=[chatbot, message_input],
                 api_name="submit_message",
             )
             send_btn.click(
                 fn=submit_message,
-                inputs=[message_input, chatbot],
+                inputs=[message_input, chatbot, chunks_slider, show_sources],
                 outputs=[chatbot, message_input],
             )
 
@@ -1211,7 +1072,7 @@ def create_interface():
 
             upload_btn.click(
                 fn=upload_document,
-                inputs=document_upload,
+                inputs=[document_upload, enable_multimodal, use_vision],
                 outputs=upload_status,
                 api_name="upload_document",
             )
